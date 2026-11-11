@@ -1,0 +1,8 @@
+{
+  "organization_id": "YOUR-ORGANIZATION-UUID",
+  "request_id": "warehouse-pick-2026-001",
+  "items": [
+    { "sku": "SKU-1001", "requested_quantity": 30 },
+    { "sku": "SKU-1002", "requested_quantity": 15 }
+  ]
+}

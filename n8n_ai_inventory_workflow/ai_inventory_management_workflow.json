@@ -1,0 +1,234 @@
+{
+  "name": "AI Inventory Management - Supabase",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-inventory-check",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Inventory Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "ai-inventory-check"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nconst organization_id = body.organization_id;\nconst items = body.items;\n\nif (!organization_id || typeof organization_id !== 'string') {\n  throw new Error('organization_id is required');\n}\nif (!Array.isArray(items) || items.length === 0) {\n  throw new Error('items must be a non-empty array');\n}\n\nconst normalized = items.map((item, index) => {\n  const sku = String(item.sku ?? '').trim();\n  const requested_quantity = Number(item.requested_quantity);\n  if (!sku) throw new Error(`items[${index}].sku is required`);\n  if (!Number.isInteger(requested_quantity) || requested_quantity <= 0) {\n    throw new Error(`items[${index}].requested_quantity must be a positive integer`);\n  }\n  return { sku, requested_quantity };\n});\n\nreturn [{\n  json: {\n    organization_id,\n    request_id: String(body.request_id ?? $execution.id),\n    items: normalized,\n    received_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "2",
+      "name": "Validate request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/products",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "id,organization_id,sku,name,stock_quantity,reorder_level,cost_price"
+            },
+            {
+              "name": "organization_id",
+              "value": "={{'eq.' + $('Validate request').first().json.organization_id}}"
+            },
+            {
+              "name": "sku",
+              "value": "={{'in.(' + $('Validate request').first().json.items.map(i => '\"' + i.sku.replace(/\"/g, '\\\\\"') + '\"').join(',') + ')'}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "3",
+      "name": "Get stock from Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const request = $('Validate request').first().json;\nconst returned = $input.all().flatMap(item => {\n  if (Array.isArray(item.json)) return item.json;\n  if (Array.isArray(item.json.body)) return item.json.body;\n  return [item.json];\n}).filter(row => row && row.sku);\n\nconst bySku = new Map(returned.map(product => [product.sku, product]));\nconst results = request.items.map(requested => {\n  const product = bySku.get(requested.sku);\n\n  if (!product) {\n    return {\n      sku: requested.sku,\n      requested_quantity: requested.requested_quantity,\n      found: false,\n      shortage: true,\n      recommendation: 'Product SKU was not found for this organization',\n      suggested_reorder_quantity: null\n    };\n  }\n\n  const stock = Number(product.stock_quantity ?? 0);\n  const reorderLevel = Number(product.reorder_level ?? 0);\n  const requestedQty = requested.requested_quantity;\n  const shortageQty = Math.max(0, requestedQty - stock);\n  const projectedStock = stock - requestedQty;\n  const needsReorder = projectedStock < reorderLevel;\n  const suggestedQty = needsReorder\n    ? Math.max(shortageQty, reorderLevel - projectedStock)\n    : 0;\n\n  return {\n    product_id: product.id,\n    sku: product.sku,\n    product_name: product.name,\n    found: true,\n    current_stock: stock,\n    requested_quantity: requestedQty,\n    shortage: shortageQty > 0,\n    shortage_quantity: shortageQty,\n    projected_stock_after_request: projectedStock,\n    reorder_level: reorderLevel,\n    needs_reorder: needsReorder,\n    suggested_reorder_quantity: suggestedQty,\n    recommendation: shortageQty > 0\n      ? `Short by ${shortageQty} units; replenish ${suggestedQty} units`\n      : needsReorder\n        ? `Request can be fulfilled; replenish ${suggestedQty} units to restore buffer`\n        : 'Sufficient stock available'\n  };\n});\n\nconst shortages = results.filter(r => r.found && r.shortage);\nconst missing = results.filter(r => !r.found);\nconst reorderRecommendations = results.filter(r => r.found && r.needs_reorder);\n\nconst response = {\n  success: missing.length === 0,\n  request_id: request.request_id,\n  organization_id: request.organization_id,\n  checked_at: new Date().toISOString(),\n  summary: {\n    items_checked: results.length,\n    shortage_count: shortages.length,\n    missing_sku_count: missing.length,\n    reorder_recommendation_count: reorderRecommendations.length\n  },\n  items: results,\n  reorder_recommendations: reorderRecommendations\n};\n\nreturn [{\n  json: {\n    organization_id: request.organization_id,\n    request_id: request.request_id,\n    request_payload: { items: request.items },\n    result: response,\n    status: missing.length ? 'needs_review' : shortages.length ? 'shortage' : 'ok'\n  }\n}];"
+      },
+      "id": "4",
+      "name": "Compare stock and recommend",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        950,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/inventory_recommendations",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "on_conflict",
+              "value": "organization_id,request_id"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { organization_id: $json.organization_id, request_id: $json.request_id, request_payload: $json.request_payload, result: $json.result, status: $json.status } }}",
+        "options": {}
+      },
+      "id": "5",
+      "name": "Save result to Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Compare stock and recommend').first().json.result }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "6",
+      "name": "Return JSON response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1450,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Inventory Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate request": {
+      "main": [
+        [
+          {
+            "node": "Get stock from Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get stock from Supabase": {
+      "main": [
+        [
+          {
+            "node": "Compare stock and recommend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare stock and recommend": {
+      "main": [
+        [
+          {
+            "node": "Save result to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save result to Supabase": {
+      "main": [
+        [
+          {
+            "node": "Return JSON response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
